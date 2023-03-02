@@ -17,7 +17,8 @@ pub struct Config {
     // With scheme included
     https_proxy_addr: String,
     https_proxy_username: String,
-    https_proxy_password: String
+    https_proxy_password: String,
+    pub(crate) port: u16,
 }
 
 // It is really just the first line.
@@ -34,7 +35,7 @@ impl HttpHeader {
         let (first_line, remainder) = data.split_at(first_line_break);
 
         let first_line = String::from_utf8_lossy(first_line);
-        println!("{:?}", first_line);
+        // println!("{:?}", first_line);
         let mut parts = first_line.split_whitespace();
 
         (
@@ -88,7 +89,6 @@ unsafe impl Sync for CurlEasy {}
 struct CurlHandler;
 impl curl::easy::Handler for CurlHandler {}
 
-
 pub async fn listen(port: u16, config: Config) {
     let listener = TcpListener::bind(("0.0.0.0", port)).await.unwrap();
     let config = Arc::new(config);
@@ -131,11 +131,11 @@ async fn handle_connection(mut stream: TcpStream, config: Arc<Config>) {
                 // communicating with the target. So we send the "normal" HTTP header.
                 let target_header = header.to_target_header();
                 curl_send_all(&mut easy, target_header.as_bytes()).await;
-                
+
                 // And the rest of the data
                 curl_send_all(&mut easy, &remainder).await;
             }
-            
+
             // Start transmitting data back and forth
             bidirectional_transmit(easy, stream).await;
         }
@@ -147,8 +147,6 @@ async fn handle_connection(mut stream: TcpStream, config: Arc<Config>) {
             }
         }
     }
-
-    // println!("-- Connection dropped!");
 }
 
 async fn curl_send_all(easy: &mut CurlEasy, data: &[u8]) {
@@ -177,7 +175,9 @@ async fn curl_read(easy: &mut CurlEasy, buffer: &mut [u8]) -> usize {
             Err(_) => {
                 let fd = easy.fd.clone();
 
-                let result = fd.read().await
+                let result = fd
+                    .read()
+                    .await
                     .readable()
                     .await
                     .unwrap()
@@ -198,15 +198,18 @@ fn std_io_would_block() -> std::io::Error {
 async fn bidirectional_transmit(mut easy: CurlEasy, stream: TcpStream) {
     let (mut stream_r, mut stream_w) = stream.into_split();
 
-    let (to_curl_send, mut to_curl_recv) = tokio::sync::mpsc::channel(100);
-    let (from_curl_send, mut from_curl_recv) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+    let (to_curl_send, mut to_curl_recv) = tokio::sync::mpsc::channel(1000);
+    let (from_curl_send, mut from_curl_recv) = tokio::sync::mpsc::channel::<Vec<u8>>(1000);
 
     // remote proxy -> client
     let remote_to_client = tokio::spawn(async move {
         loop {
             match from_curl_recv.recv().await {
-                Some(buffer) => {stream_w.write_all(&buffer).await.unwrap(); ()},
-                None => return
+                Some(buffer) => {
+                    stream_w.write_all(&buffer).await.unwrap();
+                    ()
+                }
+                None => return,
             }
         }
     });
@@ -233,10 +236,7 @@ async fn bidirectional_transmit(mut easy: CurlEasy, stream: TcpStream) {
             tokio::select! {
                 data = to_curl_recv.recv() => {
                     match data {
-                        Some(data) => {
-                            // println!("Sending to curl!");
-                            curl_send_all(&mut easy, &data).await;
-                        }
+                        Some(data) => curl_send_all(&mut easy, &data).await,
                         None => return
                     }
                 }
@@ -246,7 +246,6 @@ async fn bidirectional_transmit(mut easy: CurlEasy, stream: TcpStream) {
                         return
                     }
 
-                    // println!("Reading from curl!");
                     from_curl_send.send(buffer[..num_bytes].to_vec()).await.unwrap();
                 }
             }
