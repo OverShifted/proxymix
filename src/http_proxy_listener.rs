@@ -1,4 +1,7 @@
-use std::{ffi::c_int, sync::Arc};
+use std::{
+    ffi::{c_int, c_uint},
+    sync::Arc,
+};
 
 use bytes::BytesMut;
 use tokio::{
@@ -11,6 +14,7 @@ use url::Url;
 use serde::Deserialize;
 
 const BUFFER_SIZE: usize = 1024 * 1024;
+const CURLINFO_LASTSOCKET: c_uint = 0x200000 + 29;
 
 #[derive(Deserialize)]
 pub struct Config {
@@ -27,28 +31,71 @@ struct HttpHeader {
     pub method: String,
     pub target: String,
     pub version: String,
+
+    pub headers: Vec<(String, String)>,
+}
+
+// https://stackoverflow.com/a/35907071/11814750
+fn find_subsequence<T>(haystack: &[T], needle: &[T]) -> Option<usize>
+where
+    for<'a> &'a [T]: PartialEq,
+{
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 impl HttpHeader {
-    fn parse(data: &[u8]) -> (HttpHeader, Vec<u8>) {
-        let first_line_break = data.iter().position(|v| *v == b'\n').unwrap();
+    pub fn parse(data: &[u8]) -> (HttpHeader, &[u8]) {
+        let first_line_break = data.iter().position(|v| *v == b'\r').unwrap();
         let (first_line, remainder) = data.split_at(first_line_break);
 
         let first_line = String::from_utf8_lossy(first_line);
-        // println!("{:?}", first_line);
         let mut parts = first_line.split_whitespace();
+
+        let end_of_header = find_subsequence(remainder, b"\r\n\r\n").unwrap();
 
         (
             HttpHeader {
                 method: parts.next().unwrap().to_string(),
                 target: parts.next().unwrap().to_string(),
                 version: parts.next().unwrap().to_string(),
+                headers: Self::parse_headers(&String::from_utf8_lossy(
+                    &remainder[2..end_of_header + 1 /* Include a `\r` at the end */],
+                )),
             },
-            Vec::from(remainder),
+            &remainder[end_of_header + 4..],
         )
     }
 
-    fn to_easy_curl(&self, config: &Config) -> Result<CurlEasy, curl::Error> {
+    fn parse_headers(headers: &str) -> Vec<(String, String)> {
+        headers
+            .split('\n')
+            .filter_map(|item| {
+                if item.len() == 0 {
+                    None
+                } else {
+                    let colon_index = item.find(": ").unwrap();
+                    let (k, v) = item.split_at(colon_index);
+                    Some((k.into(), v[2..v.len() - 1].into()))
+                }
+            })
+            .collect::<Vec<(String, String)>>()
+    }
+
+    pub fn get_header(&self, key: &str) -> Option<&str> {
+        let key = key.to_lowercase();
+
+        for (k, v) in &self.headers {
+            if k.to_lowercase() == key {
+                return Some(&v);
+            }
+        }
+
+        None
+    }
+
+    pub fn to_easy_curl(&self, config: &Config) -> Result<CurlEasy, curl::Error> {
         let mut easy = curl::easy::Easy2::new(CurlHandler);
         easy.url(&self.target)?;
         easy.http_proxy_tunnel(true)?;
@@ -58,9 +105,7 @@ impl HttpHeader {
         easy.connect_only(true)?;
         easy.perform()?;
 
-        let fd = easy
-            .getopt_long(0x200000 + 29 /* CURLINFO_LASTSOCKET */)
-            .unwrap() as c_int;
+        let fd = easy.getopt_long(CURLINFO_LASTSOCKET).unwrap() as c_int;
 
         Ok(CurlEasy {
             inner: easy,
@@ -68,12 +113,25 @@ impl HttpHeader {
         })
     }
 
-    fn to_target_header(&self) -> String {
+    pub fn to_target_header(&self) -> String {
         let url = Url::parse(&self.target).unwrap();
-        format!("{} {} {}", self.method, url.path(), self.version)
+        format!(
+            "{} {} {}\r\n{}\r\n\r\n",
+            self.method,
+            url.path(),
+            self.version,
+            self.headers
+                .iter()
+                .filter(|(k, _)| !k.to_lowercase().starts_with("proxy")) // Remove headers like `Proxy-Connection`
+                .map(|(k, v)| { format!("{}: {}", k, v) }) // Encode the header
+                // FIXME: Unnecessary heap allocation here
+                // See: https://stackoverflow.com/questions/56033289/join-iterator-of-str
+                .collect::<Vec<String>>()
+                .join("\r\n")
+        )
     }
 
-    fn is_connect(&self) -> bool {
+    pub fn is_connect(&self) -> bool {
         self.method.to_uppercase() == "CONNECT"
     }
 }
@@ -94,32 +152,39 @@ pub async fn listen(port: u16, config: Config) {
     let config = Arc::new(config);
 
     loop {
-        println!("-- Waiting for connection");
         let (stream, _addr) = listener.accept().await.unwrap();
         println!("-- New connection from {}", _addr);
 
         let config = config.clone();
-        tokio::spawn(async move { handle_connection(stream, config).await });
+        tokio::spawn(async move {
+            handle_connection(stream, config).await;
+        });
     }
 }
 
 async fn handle_connection(mut stream: TcpStream, config: Arc<Config>) {
     let mut bytes = BytesMut::new();
 
-    // Wait until the first line is recved.
-    while !bytes.contains(&b'\n') {
-        stream.read_buf(&mut bytes).await.unwrap();
+    // Read the entire header
+    loop {
+        let out = stream.read_buf(&mut bytes).await.unwrap();
+
+        // IDK why, but sometimes nothing can be read from the stream.
+        // (This happened to me with firefox)
+        // Without this if statement, We will consume alot of CPU time.
+        if out == 0 {
+            stream.shutdown().await.unwrap();
+            return;
+        }
+
+        if find_subsequence(&bytes, b"\r\n\r\n").is_some() {
+            break;
+        }
     }
 
     // Extract the target host.
     let (header, remainder) = HttpHeader::parse(&bytes);
-
     let is_connect = header.is_connect();
-    if is_connect {
-        while !bytes.ends_with(b"\r\n\r\n") {
-            stream.read_buf(&mut bytes).await.unwrap();
-        }
-    }
 
     // Create a connection to the remote proxy
     match header.to_easy_curl(&config) {
@@ -137,7 +202,7 @@ async fn handle_connection(mut stream: TcpStream, config: Arc<Config>) {
             }
 
             // Start transmitting data back and forth
-            bidirectional_transmit(easy, stream).await;
+            bidirectional_transmit(easy, stream, is_connect).await;
         }
         Err(_) => {
             if is_connect {
@@ -153,9 +218,8 @@ async fn curl_send_all(easy: &mut CurlEasy, data: &[u8]) {
     let mut sent = 0;
 
     while sent < data.len() {
-        match easy.inner.send(&data[sent..]) {
-            Ok(len) => sent += len,
-            Err(_) => (),
+        if let Ok(len) = easy.inner.send(&data[sent..]) {
+            sent += len
         }
     }
 }
@@ -195,7 +259,7 @@ fn std_io_would_block() -> std::io::Error {
     std::io::Error::from(std::io::ErrorKind::WouldBlock)
 }
 
-async fn bidirectional_transmit(mut easy: CurlEasy, stream: TcpStream) {
+async fn bidirectional_transmit(mut easy: CurlEasy, stream: TcpStream, is_connect: bool) {
     let (mut stream_r, mut stream_w) = stream.into_split();
 
     let (to_curl_send, mut to_curl_recv) = tokio::sync::mpsc::channel(1000);
@@ -203,13 +267,43 @@ async fn bidirectional_transmit(mut easy: CurlEasy, stream: TcpStream) {
 
     // remote proxy -> client
     let remote_to_client = tokio::spawn(async move {
+        let mut bytes = BytesMut::new();
+        let mut bytes_remaining: Option<usize> = None;
+
         loop {
             match from_curl_recv.recv().await {
                 Some(buffer) => {
                     stream_w.write_all(&buffer).await.unwrap();
-                    ()
+
+                    if !is_connect {
+                        if let Some(bytes_remaining) = bytes_remaining.as_mut() {
+                            *bytes_remaining -= buffer.len();
+                        } else {
+                            bytes.extend_from_slice(&buffer);
+
+                            if let Some(pos) = find_subsequence(&bytes, b"\r\n\r\n") {
+                                bytes_remaining = Some(
+                                    HttpHeader::parse(&bytes)
+                                        .0
+                                        .get_header("content-length")
+                                        .unwrap()
+                                        .parse()
+                                        .unwrap(),
+                                );
+                                *bytes_remaining.as_mut().unwrap() -= buffer.len() - pos - 4;
+                                bytes.clear();
+                            }
+                        }
+
+                        if let Some(v) = bytes_remaining {
+                            if v == 0 {
+                                // End of http transaction
+                                return true;
+                            }
+                        }
+                    }
                 }
-                None => return,
+                None => return false,
             }
         }
     });
@@ -219,10 +313,12 @@ async fn bidirectional_transmit(mut easy: CurlEasy, stream: TcpStream) {
         loop {
             let mut buffer = vec![0; BUFFER_SIZE];
             match stream_r.read(&mut buffer).await {
-                Ok(num_bytes) if num_bytes > 0 => to_curl_send
-                    .send(buffer[..num_bytes].to_vec())
-                    .await
-                    .unwrap(),
+                Ok(num_bytes) if num_bytes > 0 => {
+                    to_curl_send
+                        .send(buffer[..num_bytes].to_vec())
+                        .await
+                        .unwrap();
+                }
                 _ => return,
             };
         }
